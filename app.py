@@ -1,9 +1,9 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  Garlic Order & Delivery Platform  —  app.py  FINAL v8                     ║
+# ║  Garlic Order & Delivery Platform  —  app.py  FINAL v9                     ║
+# ║  ROUTE FILE UPLOAD: Admin uploads CSV/Excel → preview → create trip        ║
 # ║  GPS FIX: Single "Get My Location" button → auto-fills Lat/Long            ║
-# ║           → shows map preview → saves to sheet                             ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-import os, uuid, textwrap
+import os, uuid, textwrap, io
 from datetime import datetime, date
 
 import streamlit as st
@@ -57,6 +57,36 @@ header[data-testid="stHeader"]{ background:transparent; }
   background:#e8f5e9; border:2px solid #1a7f4b; border-radius:12px;
   padding:12px 16px; margin:8px 0; font-size:14px; font-weight:600; color:#0d1f14;
 }
+.route-card{
+  background:#fff; border:1.5px solid var(--border); border-radius:14px;
+  padding:16px 20px; margin:10px 0;
+  box-shadow:0 2px 8px rgba(26,127,75,.07);
+}
+.route-card-header{
+  font-family:'Syne',sans-serif; font-weight:700; font-size:1rem;
+  color:#0d1f14; margin-bottom:8px;
+}
+.route-row{
+  display:flex; align-items:center; gap:10px;
+  border-bottom:1px solid #eee; padding:6px 0; font-size:.88rem;
+}
+.route-row:last-child{ border-bottom:none; }
+.stop-badge{
+  background:#1a7f4b; color:#fff; border-radius:50%;
+  width:24px; height:24px; display:inline-flex;
+  align-items:center; justify-content:center;
+  font-size:.75rem; font-weight:700; flex-shrink:0;
+}
+.upload-zone{
+  background:#f4faf7; border:2px dashed #1a7f4b; border-radius:14px;
+  padding:24px; text-align:center; margin:10px 0;
+}
+.template-box{
+  background:#fffbf0; border:1.5px solid #f5d6a7; border-radius:10px;
+  padding:12px 16px; margin:8px 0; font-size:.85rem; color:#6b4a00;
+}
+.warn-row{ background:#fff8e1; border-radius:8px; padding:6px 10px; margin:4px 0; font-size:.83rem; }
+.ok-row  { background:#e8f5e9; border-radius:8px; padding:6px 10px; margin:4px 0; font-size:.83rem; }
 div[data-testid="stTextInput"] input,
 div[data-testid="stSelectbox"] select,
 div[data-testid="stNumberInput"] input,
@@ -80,11 +110,11 @@ DEFAULTS = {
     "driver_id": None,  "driver_active": True,
     "active_stop": 0,   "cust_data": {},
     "task_done": False,  "_gps_requested": False,
+    "route_parsed_df": None, "route_file_name": None,
 }
 for _k, _v in DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
-# GPS coords kept separate — must survive reruns, cleared only after successful save
 if "_geo_lat" not in st.session_state: st.session_state["_geo_lat"] = ""
 if "_geo_lng" not in st.session_state: st.session_state["_geo_lng"] = ""
 
@@ -188,15 +218,7 @@ def open_spreadsheet():
     try:
         return client.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
-        st.error(f"""
-❌ **Sheet not found: "{SPREADSHEET_NAME}"**
-
-**One-time setup:**
-1. Go to [sheets.google.com](https://sheets.google.com) → New blank spreadsheet
-2. Rename it exactly: **`Garlic_Order & Delivery Project`**
-3. Share it with your service-account `client_email` as **Editor**
-4. Reboot this app
-""")
+        st.error(f'❌ Sheet not found: "{SPREADSHEET_NAME}"')
         st.stop()
 
 def get_ws(key: str):
@@ -294,6 +316,101 @@ def write_admin_log(admin_uid, mail_id, action, entity, entity_id, old="", new="
                              str(entity_id),str(old),str(new),notes])
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  ROUTE FILE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Required columns for route file
+ROUTE_REQUIRED_COLS = ["CUST-ID", "Shop Name", "City"]
+ROUTE_OPTIONAL_COLS = ["Shop Address", "Mobile", "Stop Order"]
+
+ROUTE_TEMPLATE_CSV = """CUST-ID,Shop Name,City,Shop Address,Mobile,Stop Order
+CUST-AABBCC,Sri Lakshmi Provision,Bengaluru,"12 MG Road, Bengaluru",9876543210,1
+CUST-DDEEFF,Hotel Majestic,Mysuru,"45 Sayyaji Rao Road, Mysuru",9123456789,2
+"""
+
+def parse_route_file(uploaded_file) -> tuple:
+    """
+    Parse uploaded CSV or Excel route file.
+    Returns (df, errors_list, warnings_list)
+    """
+    errors = []; warnings = []
+    fname  = uploaded_file.name.lower()
+    try:
+        if fname.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        elif fname.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(uploaded_file)
+        else:
+            return None, ["Unsupported file type. Upload a .csv or .xlsx file."], []
+    except Exception as e:
+        return None, [f"Could not read file: {e}"], []
+
+    # Normalise column names
+    df.columns = [c.strip() for c in df.columns]
+
+    # Check required columns
+    missing = [c for c in ROUTE_REQUIRED_COLS if c not in df.columns]
+    if missing:
+        errors.append(f"Missing required column(s): {', '.join(missing)}")
+        return None, errors, warnings
+
+    # Drop fully empty rows
+    df = df.dropna(how="all").reset_index(drop=True)
+    if df.empty:
+        errors.append("File contains no data rows."); return None, errors, warnings
+
+    # Validate CUST-ID column
+    bad_ids = df[df["CUST-ID"].astype(str).str.strip() == ""]
+    if not bad_ids.empty:
+        warnings.append(f"{len(bad_ids)} row(s) have blank CUST-ID and will be skipped.")
+        df = df[df["CUST-ID"].astype(str).str.strip() != ""].reset_index(drop=True)
+
+    # Validate City column
+    allowed_cities = ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"]
+    bad_cities = df[~df["City"].astype(str).isin(allowed_cities)]
+    if not bad_cities.empty:
+        warnings.append(f"{len(bad_cities)} row(s) have an unknown city value.")
+
+    # Sort by Stop Order if present
+    if "Stop Order" in df.columns:
+        try:
+            df["Stop Order"] = pd.to_numeric(df["Stop Order"], errors="coerce")
+            df = df.sort_values("Stop Order", na_position="last").reset_index(drop=True)
+        except Exception:
+            warnings.append("Could not sort by 'Stop Order' — using file row order instead.")
+
+    return df, errors, warnings
+
+
+def validate_route_against_customers(route_df: pd.DataFrame, custs_df: pd.DataFrame):
+    """
+    Cross-check CUST-IDs in route file against customer_onboard sheet.
+    Returns (matched_df, unmatched_ids)
+    """
+    if custs_df.empty:
+        return route_df, []
+    valid_ids = set(custs_df["CUST-ID"].astype(str).str.strip())
+    route_ids = route_df["CUST-ID"].astype(str).str.strip()
+    matched   = route_df[route_ids.isin(valid_ids)].reset_index(drop=True)
+    unmatched = route_ids[~route_ids.isin(valid_ids)].tolist()
+    return matched, unmatched
+
+
+def generate_route_template_excel():
+    """Generate a downloadable Excel template for route uploads."""
+    buf = io.BytesIO()
+    df  = pd.DataFrame([
+        {"CUST-ID":"CUST-AABBCC","Shop Name":"Sri Lakshmi Provision","City":"Bengaluru",
+         "Shop Address":"12 MG Road, Bengaluru","Mobile":"9876543210","Stop Order":1},
+        {"CUST-ID":"CUST-DDEEFF","Shop Name":"Hotel Majestic","City":"Mysuru",
+         "Shop Address":"45 Sayyaji Rao Road, Mysuru","Mobile":"9123456789","Stop Order":2},
+    ])
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Route")
+    buf.seek(0)
+    return buf.read()
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  AUTH
 # ═══════════════════════════════════════════════════════════════════════════════
 def gen_uid(role):
@@ -302,6 +419,7 @@ def gen_uid(role):
 def gen_cust_id():   return f"CUST-{uuid.uuid4().hex[:6].upper()}"
 def gen_driver_id(): return f"DD-{uuid.uuid4().hex[:6].upper()}"
 def gen_order_id():  return f"ORD-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+def gen_trip_id():   return f"TRP-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
 
 def register_user(name, phone, email, role, password):
     email = email.strip().lower()
@@ -336,26 +454,18 @@ def pill(text, cls="pill-pend"):
     return f'<span class="pill {cls}">{text}</span>'
 
 def map_embed(lat, lng, height=260):
-    """Embed Google Map using lat/lng coordinates."""
     if not lat or not lng: return ""
     return (f'<div class="map-frame"><iframe width="100%" height="{height}"'
             f' frameborder="0" style="border:0;display:block" allowfullscreen'
             f' src="https://maps.google.com/maps?q={lat},{lng}&output=embed&z=16">'
             f'</iframe></div>')
 
-# ── GPS COMPONENT ─────────────────────────────────────────────────────────────
 def gps_capture_component():
-    """
-    GPS capture using streamlit_js_eval's get_geolocation().
-    Returns (lat_str, lng_str) — empty strings if not yet captured.
-    """
     cur_lat = st.session_state.get("_geo_lat", "")
     cur_lng = st.session_state.get("_geo_lng", "")
-
     if st.button("📍 Get My Current Location", type="primary", key="gps_loc_btn"):
         st.session_state["_gps_requested"] = True
         st.rerun()
-
     if st.session_state.get("_gps_requested", False) and not (cur_lat and cur_lng):
         st.info("⏳ Requesting location access from your browser…")
         loc = get_geolocation()
@@ -367,9 +477,7 @@ def gps_capture_component():
             cur_lat = st.session_state["_geo_lat"]
             cur_lng = st.session_state["_geo_lng"]
             st.rerun()
-
     return cur_lat, cur_lng
-
 
 def topbar(role_label, role_color="#1a7f4b"):
     user = st.session_state.user
@@ -484,7 +592,9 @@ def page_admin():
     tabs = st.tabs(["📦 SKUs","🗺️ Trips","🚚 Assign Drivers",
                     "👤 Customers","🚗 Driver Onboard","📋 Orders","📝 Audit Log"])
 
+    # ──────────────────────────────────────────────────────────────────────────
     # TAB 0 — SKUs
+    # ──────────────────────────────────────────────────────────────────────────
     with tabs[0]:
         st.markdown(sl("📦 SKU Master"), unsafe_allow_html=True)
         df_sku = read_sheet("skus")
@@ -538,61 +648,414 @@ def page_admin():
                     load_skus.clear(); st.session_state.task_done=True; st.rerun()
                 st.divider()
 
-    # TAB 1 — Trips
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAB 1 — Trips  (UPDATED: Route File Upload)
+    # ──────────────────────────────────────────────────────────────────────────
     with tabs[1]:
         st.markdown(sl("🗺️ Trips & Routes"), unsafe_allow_html=True)
-        with st.expander("➕ Create new trip"):
-            tc1,tc2 = st.columns(2)
-            with tc1:
-                tr_id   = st.text_input("Trip ID *", placeholder="TRP-001", key="tr_id")
-                tr_date = st.date_input("Date *", value=date.today(), key="tr_date")
-            with tc2:
-                tr_city = st.selectbox("City",
-                    ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"],key="tr_city")
-            custs_df = load_customers()
-            if not custs_df.empty:
-                shop_opts = custs_df.apply(
-                    lambda r: f"{r['CUST-ID']} — {r['Shop Name']} ({r['City']})",axis=1).tolist()
-                cust_ids  = custs_df["CUST-ID"].tolist()
-                sel_shops = st.multiselect("Select shops * (multiple allowed)",shop_opts,key="tr_shops")
-                sel_ids   = [cust_ids[shop_opts.index(s)] for s in sel_shops]
-                if sel_ids:
-                    st.info(f"✅ {len(sel_ids)} shop(s): {', '.join(sel_ids)}")
-            else:
-                st.warning("No customers onboarded yet."); sel_ids=[]
-            if st.button("✅ Create Trip", type="primary", key="tr_btn"):
-                if not tr_id: st.error("Trip ID required.")
-                elif not sel_ids: st.error("Select at least one shop.")
-                elif col_exists("trips","Trip ID",tr_id): st.error("Trip ID already exists.")
-                else:
-                    append_row("trips",[tr_id,str(tr_date),tr_city,",".join(sel_ids),
-                                        "","","Assigned",user["uid"],
-                                        datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-                    write_admin_log(user["uid"],user.get("email",""),
-                                    "CREATE TRIP","Trip",tr_id,"","",f"{len(sel_ids)} shops")
-                    st.success(f"✅ Trip **{tr_id}** created with {len(sel_ids)} shop(s)!")
-                    st.session_state.task_done=True; st.rerun()
-        trips_df = read_sheet("trips")
-        if not trips_df.empty:
-            custs = load_customers()
-            def shop_names_for(v):
-                ids=[s.strip() for s in str(v).split(",") if s.strip()]
-                names=[]
-                for sid in ids:
-                    if not custs.empty:
-                        m=custs[custs["CUST-ID"]==sid]
-                        names.append(m.iloc[0]["Shop Name"] if not m.empty else sid)
-                    else: names.append(sid)
-                return ", ".join(names)
-            disp=trips_df.copy()
-            disp["Shop Count"]=disp["Shops"].apply(lambda v:len([s for s in str(v).split(",") if s.strip()]))
-            disp["Shop Names"]=disp["Shops"].apply(shop_names_for)
-            st.dataframe(disp[["Trip ID","Date","City","Shop Count","Shop Names","Driver Name","Status"]],
-                         use_container_width=True,hide_index=True)
-        else:
-            st.info("No trips yet.")
 
+        custs_df = load_customers()
+
+        # ── Sub-tabs inside Trips ────────────────────────────────────────────
+        trip_sub = st.tabs(["📂 Upload Route File", "✏️ Manual Trip", "📋 All Trips"])
+
+        # ════════════════════════════════════════
+        # SUB-TAB A: Upload Route File
+        # ════════════════════════════════════════
+        with trip_sub[0]:
+            st.markdown("#### 📂 Upload a Route File to Create a Trip")
+
+            # Template download
+            st.markdown(
+                '<div class="template-box">'
+                '📄 <strong>Required columns:</strong> '
+                '<code>CUST-ID</code>, <code>Shop Name</code>, <code>City</code> &nbsp;|&nbsp; '
+                'Optional: <code>Shop Address</code>, <code>Mobile</code>, <code>Stop Order</code>'
+                '</div>', unsafe_allow_html=True)
+
+            dl_col1, dl_col2 = st.columns(2)
+            with dl_col1:
+                st.download_button(
+                    "⬇️ Download Excel Template",
+                    data=generate_route_template_excel(),
+                    file_name="route_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_tpl_xlsx",
+                )
+            with dl_col2:
+                st.download_button(
+                    "⬇️ Download CSV Template",
+                    data=ROUTE_TEMPLATE_CSV,
+                    file_name="route_template.csv",
+                    mime="text/csv",
+                    key="dl_tpl_csv",
+                )
+
+            st.divider()
+
+            # ── File uploader ────────────────────────────────────────────────
+            uploaded = st.file_uploader(
+                "Upload your Route File (.csv or .xlsx)",
+                type=["csv","xlsx","xls"],
+                key="route_uploader",
+                help="Each row = one shop stop. CUST-ID must match Customer Onboard Data.",
+            )
+
+            if uploaded:
+                # Parse immediately on upload
+                with st.spinner("Parsing route file…"):
+                    df_route, errors, warnings = parse_route_file(uploaded)
+
+                if errors:
+                    for e in errors:
+                        st.error(f"❌ {e}")
+                else:
+                    # Validate against customer master
+                    df_matched, unmatched_ids = validate_route_against_customers(df_route, custs_df)
+
+                    # Show warnings
+                    for w in warnings:
+                        st.warning(f"⚠️ {w}")
+                    if unmatched_ids:
+                        st.warning(f"⚠️ {len(unmatched_ids)} CUST-ID(s) not found in Customer Onboard Data "
+                                   f"and will be skipped: `{', '.join(unmatched_ids[:8])}`"
+                                   + (" …" if len(unmatched_ids)>8 else ""))
+
+                    if df_matched.empty:
+                        st.error("❌ No valid customer rows after validation. Check your CUST-IDs.")
+                    else:
+                        # ── Preview card ─────────────────────────────────────
+                        st.success(f"✅ **{len(df_matched)} valid stop(s)** found in route file.")
+
+                        st.markdown(
+                            f'<div class="route-card">'
+                            f'<div class="route-card-header">🗺️ Route Preview — {len(df_matched)} Stops</div>',
+                            unsafe_allow_html=True)
+
+                        for i, row in df_matched.iterrows():
+                            cid  = str(row.get("CUST-ID","")).strip()
+                            shop = str(row.get("Shop Name","")).strip()
+                            city = str(row.get("City","")).strip()
+                            addr = str(row.get("Shop Address","")).strip()
+
+                            # Enrich from customer master if available
+                            if not custs_df.empty:
+                                cm = custs_df[custs_df["CUST-ID"]==cid]
+                                if not cm.empty:
+                                    shop = cm.iloc[0].get("Shop Name", shop) or shop
+                                    addr = cm.iloc[0].get("Shop Address", addr) or addr
+                                    city = cm.iloc[0].get("City", city) or city
+
+                            st.markdown(
+                                f'<div class="route-row">'
+                                f'<span class="stop-badge">{i+1}</span>'
+                                f'<strong>{shop}</strong>'
+                                f'&nbsp;<span style="color:#5a7a65;font-size:.83rem">({cid})</span>'
+                                f'&nbsp;·&nbsp;<span style="color:#185fa5">{city}</span>'
+                                + (f'&nbsp;·&nbsp;<span style="color:#854f0b;font-size:.8rem">{addr}</span>' if addr else "")
+                                + f'</div>',
+                                unsafe_allow_html=True)
+
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+                        # ── Trip creation form ────────────────────────────────
+                        st.divider()
+                        st.markdown("#### ⚙️ Trip Settings")
+
+                        rf1, rf2, rf3 = st.columns(3)
+                        with rf1:
+                            auto_trip_id = gen_trip_id()
+                            rf_trip_id = st.text_input(
+                                "Trip ID *",
+                                value=auto_trip_id,
+                                key="rf_trip_id",
+                                help="Auto-generated — edit if needed")
+                        with rf2:
+                            rf_date = st.date_input("Trip Date *", value=date.today(), key="rf_date")
+                        with rf3:
+                            # Auto-detect city from most common city in file
+                            city_mode = df_matched["City"].mode()
+                            def_city  = city_mode.iloc[0] if not city_mode.empty else "Bengaluru"
+                            allowed_cities = ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"]
+                            def_idx = allowed_cities.index(def_city) if def_city in allowed_cities else 0
+                            rf_city = st.selectbox("City *", allowed_cities, index=def_idx, key="rf_city")
+
+                        # Driver assignment (optional at creation)
+                        all_d = all_drivers()
+                        rf_drv_uid = ""; rf_drv_name = ""
+                        if not all_d.empty:
+                            drv_opts  = ["⬜ Assign later"] + [
+                                f"{'🟢' if str(r.get('Active Status','')).lower()=='active' else '⚫'} "
+                                f"{r['Full Name']} ({r['Driver ID']})"
+                                for _,r in all_d.iterrows()
+                            ]
+                            drv_ids   = [""] + all_d["Driver ID"].tolist()
+                            drv_names = [""] + all_d["Full Name"].tolist()
+                            sel_drv   = st.selectbox(
+                                "Assign Driver (optional — can do later)",
+                                drv_opts, key="rf_driver_sel")
+                            drv_idx   = drv_opts.index(sel_drv)
+                            rf_drv_uid  = drv_ids[drv_idx]
+                            rf_drv_name = drv_names[drv_idx]
+
+                        st.divider()
+
+                        # ── Summary before create ─────────────────────────────
+                        st.markdown(
+                            f'<div class="route-card">'
+                            f'<div class="route-card-header">📋 Trip Summary</div>'
+                            f'<div class="route-row"><span style="width:120px;color:#5a7a65">Trip ID</span>'
+                            f'<strong>{rf_trip_id}</strong></div>'
+                            f'<div class="route-row"><span style="width:120px;color:#5a7a65">Date</span>'
+                            f'<strong>{rf_date}</strong></div>'
+                            f'<div class="route-row"><span style="width:120px;color:#5a7a65">City</span>'
+                            f'<strong>{rf_city}</strong></div>'
+                            f'<div class="route-row"><span style="width:120px;color:#5a7a65">Stops</span>'
+                            f'<strong>{len(df_matched)}</strong></div>'
+                            f'<div class="route-row"><span style="width:120px;color:#5a7a65">Driver</span>'
+                            f'<strong>{rf_drv_name or "To be assigned"}</strong></div>'
+                            f'</div>', unsafe_allow_html=True)
+
+                        if st.button("✅ Create Trip from Route File",
+                                     type="primary", use_container_width=True,
+                                     key="rf_create_trip"):
+                            if not rf_trip_id.strip():
+                                st.error("Trip ID is required.")
+                            elif col_exists("trips","Trip ID", rf_trip_id.strip()):
+                                st.error(f"Trip ID **{rf_trip_id}** already exists. Change it.")
+                            else:
+                                shop_ids_str = ",".join(df_matched["CUST-ID"].astype(str).str.strip().tolist())
+                                status = "Assigned" if rf_drv_uid else "Unassigned"
+                                append_row("trips",[
+                                    rf_trip_id.strip(),
+                                    str(rf_date),
+                                    rf_city,
+                                    shop_ids_str,
+                                    rf_drv_uid,
+                                    rf_drv_name,
+                                    status,
+                                    user["uid"],
+                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                ])
+                                write_admin_log(
+                                    user["uid"], user.get("email",""),
+                                    "CREATE TRIP (ROUTE FILE)", "Trip",
+                                    rf_trip_id.strip(), "",
+                                    rf_drv_name or "Unassigned",
+                                    f"{len(df_matched)} stops from {uploaded.name}"
+                                )
+                                drv_msg = f" · Driver: **{rf_drv_name}**" if rf_drv_name else " · Driver: **to be assigned**"
+                                st.success(
+                                    f"✅ Trip **{rf_trip_id}** created with "
+                                    f"**{len(df_matched)} stop(s)**{drv_msg}!"
+                                )
+                                st.session_state.route_parsed_df  = None
+                                st.session_state.route_file_name  = None
+                                st.session_state.task_done        = True
+                                st.balloons()
+                                st.rerun()
+
+            else:
+                st.markdown(
+                    '<div class="upload-zone">'
+                    '<span style="font-size:2.2rem">📂</span><br>'
+                    '<strong style="font-family:Syne,sans-serif;color:#1a7f4b">Drop your route file here</strong><br>'
+                    '<span style="color:#5a7a65;font-size:.88rem">Supports .csv and .xlsx — '
+                    'download the template above to get started</span>'
+                    '</div>', unsafe_allow_html=True)
+
+        # ════════════════════════════════════════
+        # SUB-TAB B: Manual Trip
+        # ════════════════════════════════════════
+        with trip_sub[1]:
+            st.markdown("#### ✏️ Create Trip Manually")
+            with st.container():
+                tc1,tc2 = st.columns(2)
+                with tc1:
+                    tr_id   = st.text_input("Trip ID *", placeholder="TRP-001", key="tr_id")
+                    tr_date = st.date_input("Date *", value=date.today(), key="tr_date")
+                with tc2:
+                    tr_city = st.selectbox("City",
+                        ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"],key="tr_city")
+
+                if not custs_df.empty:
+                    shop_opts = custs_df.apply(
+                        lambda r: f"{r['CUST-ID']} — {r['Shop Name']} ({r['City']})",axis=1).tolist()
+                    cust_ids  = custs_df["CUST-ID"].tolist()
+                    sel_shops = st.multiselect("Select shops * (multiple allowed)",shop_opts,key="tr_shops")
+                    sel_ids   = [cust_ids[shop_opts.index(s)] for s in sel_shops]
+                    if sel_ids:
+                        st.info(f"✅ {len(sel_ids)} shop(s): {', '.join(sel_ids)}")
+                else:
+                    st.warning("No customers onboarded yet. Use the **Customer Onboard** tab.")
+                    sel_ids = []
+
+                if st.button("✅ Create Trip", type="primary", key="tr_btn"):
+                    if not tr_id: st.error("Trip ID required.")
+                    elif not sel_ids: st.error("Select at least one shop.")
+                    elif col_exists("trips","Trip ID",tr_id): st.error("Trip ID already exists.")
+                    else:
+                        append_row("trips",[tr_id,str(tr_date),tr_city,",".join(sel_ids),
+                                            "","","Unassigned",user["uid"],
+                                            datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                        write_admin_log(user["uid"],user.get("email",""),
+                                        "CREATE TRIP","Trip",tr_id,"","",f"{len(sel_ids)} shops")
+                        st.success(f"✅ Trip **{tr_id}** created with {len(sel_ids)} shop(s)!")
+                        st.session_state.task_done=True; st.rerun()
+
+        # ════════════════════════════════════════
+        # SUB-TAB C: All Trips (with inline driver assign)
+        # ════════════════════════════════════════
+        with trip_sub[2]:
+            st.markdown("#### 📋 All Trips")
+            trips_df = read_sheet("trips")
+
+            if trips_df.empty:
+                st.info("No trips yet. Create one using Upload or Manual tab above.")
+            else:
+                # Metrics
+                total_t = len(trips_df)
+                unassigned_t = len(trips_df[trips_df["Driver Name"].astype(str).str.strip().isin(["","nan"])])
+                assigned_t   = total_t - unassigned_t
+                completed_t  = len(trips_df[trips_df["Status"].astype(str).str.lower()=="completed"])
+                tm1,tm2,tm3,tm4 = st.columns(4)
+                tm1.metric("Total Trips", total_t)
+                tm2.metric("🟢 Driver Assigned", assigned_t)
+                tm3.metric("⚠️ Unassigned", unassigned_t)
+                tm4.metric("✅ Completed", completed_t)
+                st.divider()
+
+                # Filter
+                flt_status = st.selectbox(
+                    "Filter by status",
+                    ["All","Unassigned","Assigned","In Progress","Completed"],
+                    key="trip_list_filter")
+                disp_trips = trips_df.copy()
+                if flt_status != "All":
+                    disp_trips = disp_trips[
+                        disp_trips["Status"].astype(str).str.lower() == flt_status.lower()
+                    ]
+
+                all_d_for_assign = all_drivers()
+
+                for _, t in disp_trips.iterrows():
+                    shop_ids = [s.strip() for s in str(t.get("Shops","")).split(",") if s.strip()]
+                    drv_name = str(t.get("Driver Name","")).strip()
+                    drv_uid  = str(t.get("Driver UID","")).strip()
+                    t_status = str(t.get("Status","")).strip()
+
+                    status_cls = {
+                        "completed": "pill-done",
+                        "in progress": "pill-part",
+                        "assigned": "pill-on",
+                        "unassigned": "pill-pend",
+                    }.get(t_status.lower(), "pill-pend")
+
+                    with st.container():
+                        hc1, hc2, hc3, hc4 = st.columns([3, 2, 2, 2])
+                        with hc1:
+                            st.markdown(
+                                f'<strong style="font-family:Syne,sans-serif">{t["Trip ID"]}</strong>'
+                                f'&nbsp;{pill(t_status, status_cls)}',
+                                unsafe_allow_html=True)
+                            st.caption(f"📅 {t.get('Date','')} · 📍 {t.get('City','')} · {len(shop_ids)} stop(s)")
+                        with hc2:
+                            st.caption("Driver")
+                            st.markdown(
+                                f'<strong>{drv_name if drv_name and drv_name!="nan" else "—"}</strong>'
+                                + (f'<br><code style="font-size:.72rem">{drv_uid}</code>'
+                                   if drv_uid and drv_uid!="nan" else ""),
+                                unsafe_allow_html=True)
+                        with hc3:
+                            st.caption("Created by")
+                            st.write(str(t.get("Created By","")))
+                        with hc4:
+                            st.caption("Created at")
+                            st.write(str(t.get("Created At","")))
+
+                    # Expandable stops list
+                    with st.expander(f"🔍 View {len(shop_ids)} Stop(s) for {t['Trip ID']}"):
+                        if custs_df.empty:
+                            st.write(", ".join(shop_ids))
+                        else:
+                            for si, sid in enumerate(shop_ids):
+                                cm = custs_df[custs_df["CUST-ID"]==sid]
+                                if not cm.empty:
+                                    r = cm.iloc[0]
+                                    st.markdown(
+                                        f'<div class="route-row">'
+                                        f'<span class="stop-badge">{si+1}</span>'
+                                        f'<strong>{r.get("Shop Name","")}</strong>'
+                                        f'&nbsp;<span style="color:#5a7a65;font-size:.83rem">({sid})</span>'
+                                        f'&nbsp;·&nbsp;<span style="color:#185fa5">{r.get("City","")}</span>'
+                                        f'&nbsp;·&nbsp;<span style="color:#854f0b;font-size:.8rem">'
+                                        f'{r.get("Shop Address","")}</span>'
+                                        f'</div>', unsafe_allow_html=True)
+                                else:
+                                    st.markdown(
+                                        f'<div class="route-row">'
+                                        f'<span class="stop-badge">{si+1}</span>'
+                                        f'<span style="color:#842029">{sid} (not found in master)</span>'
+                                        f'</div>', unsafe_allow_html=True)
+
+                        # ── Inline driver assign ──────────────────────────────
+                        if t_status.lower() not in ("completed",) and not all_d_for_assign.empty:
+                            st.divider()
+                            st.markdown("**Assign / Change Driver**")
+                            ia1, ia2 = st.columns([4, 2])
+                            with ia1:
+                                drv_labels_ia = []
+                                drv_ids_ia    = []
+                                drv_names_ia  = []
+                                for _, dr in all_d_for_assign.iterrows():
+                                    s   = str(dr.get("Active Status","Offline"))
+                                    ico = "🟢" if s.lower()=="active" else "⚫"
+                                    drv_labels_ia.append(
+                                        f"{ico} {dr['Full Name']} | {dr['Driver ID']} | {s}")
+                                    drv_ids_ia.append(dr["Driver ID"])
+                                    drv_names_ia.append(dr["Full Name"])
+
+                                # Pre-select current driver if already assigned
+                                cur_idx = 0
+                                if drv_uid and drv_uid in drv_ids_ia:
+                                    cur_idx = drv_ids_ia.index(drv_uid)
+
+                                sel_ia = st.selectbox(
+                                    "Select driver",
+                                    drv_labels_ia,
+                                    index=cur_idx,
+                                    key=f"ia_drv_{t['Trip ID']}",
+                                    label_visibility="collapsed")
+                                ia_idx      = drv_labels_ia.index(sel_ia)
+                                ia_drv_id   = drv_ids_ia[ia_idx]
+                                ia_drv_name = drv_names_ia[ia_idx]
+
+                            with ia2:
+                                st.write("")
+                                if st.button(
+                                    "✅ Assign",
+                                    key=f"ia_btn_{t['Trip ID']}",
+                                    type="primary",
+                                    use_container_width=True):
+                                    update_row("trips","Trip ID",t["Trip ID"],{
+                                        "Driver UID":  ia_drv_id,
+                                        "Driver Name": ia_drv_name,
+                                        "Status":      "Assigned",
+                                    })
+                                    write_admin_log(
+                                        user["uid"],user.get("email",""),
+                                        "ASSIGN DRIVER","Trip",t["Trip ID"],
+                                        drv_name,ia_drv_id,ia_drv_name)
+                                    st.success(
+                                        f"✅ **{ia_drv_name}** assigned to **{t['Trip ID']}**!")
+                                    st.session_state.task_done = True
+                                    st.rerun()
+
+                    st.divider()
+
+    # ──────────────────────────────────────────────────────────────────────────
     # TAB 2 — Assign Drivers
+    # ──────────────────────────────────────────────────────────────────────────
     with tabs[2]:
         st.markdown(sl("🚚 Assign Drivers to Trips"), unsafe_allow_html=True)
         all_d    = all_drivers()
@@ -659,7 +1122,9 @@ def page_admin():
             disp_t["Driver Name"]=disp_t["Driver Name"].apply(lambda v:v if str(v).strip() else "⚠️ Unassigned")
             st.dataframe(disp_t,use_container_width=True,hide_index=True)
 
+    # ──────────────────────────────────────────────────────────────────────────
     # TAB 3 — Customers
+    # ──────────────────────────────────────────────────────────────────────────
     with tabs[3]:
         st.markdown(sl("👤 Customer Onboard Data"), unsafe_allow_html=True)
         df_c=load_customers()
@@ -671,7 +1136,9 @@ def page_admin():
             c3.metric("Cities",df_c["City"].nunique())
             st.dataframe(df_c,use_container_width=True,hide_index=True)
 
+    # ──────────────────────────────────────────────────────────────────────────
     # TAB 4 — Driver Onboard
+    # ──────────────────────────────────────────────────────────────────────────
     with tabs[4]:
         st.markdown(sl("🚗 Driver Onboard","amber"), unsafe_allow_html=True)
         all_d2=all_drivers()
@@ -740,7 +1207,9 @@ def page_admin():
                     st.success(f"✅ Driver onboarded! Permanent Driver ID: **`{did}`**")
                     st.session_state.task_done=True; st.rerun()
 
+    # ──────────────────────────────────────────────────────────────────────────
     # TAB 5 — Orders
+    # ──────────────────────────────────────────────────────────────────────────
     with tabs[5]:
         st.markdown(sl("📋 All Orders"), unsafe_allow_html=True)
         df_o=read_sheet("base")
@@ -765,7 +1234,9 @@ def page_admin():
             else:
                 st.dataframe(df_show,use_container_width=True,hide_index=True)
 
+    # ──────────────────────────────────────────────────────────────────────────
     # TAB 6 — Audit Log
+    # ──────────────────────────────────────────────────────────────────────────
     with tabs[6]:
         st.markdown(sl("📝 Admin Audit Log","blue"), unsafe_allow_html=True)
         df_l=read_sheet("admin_log")
@@ -782,6 +1253,7 @@ def page_admin():
     else:
         st.success("✅ Tasks marked complete — Logout button is now active above.")
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PAGE: SALES EXECUTIVE (T1)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -790,7 +1262,6 @@ def page_sales():
     topbar("🧑‍💼 Sales Executive · T1")
     tabs = st.tabs(["➕ New Order","👤 Onboard Customer","📋 My Orders"])
 
-    # ── TAB 0: New Order ──────────────────────────────────────────────────────
     with tabs[0]:
         st.markdown(sl("🔍 Customer Lookup"), unsafe_allow_html=True)
         lc1,lc2,lc3=st.columns([2,2,1])
@@ -799,7 +1270,6 @@ def page_sales():
         with lc3:
             st.write(""); st.write("")
             do_lk=st.button("Fetch →",key="lk_btn")
-
         if do_lk:
             with st.spinner("Looking up…"):
                 cust=(find_row("customer_onboard","CUST-ID",lk_id.strip()) if lk_id.strip()
@@ -810,9 +1280,7 @@ def page_sales():
             else:
                 st.error("❌ Customer not found. Onboard them first.")
                 st.session_state.cust_data={}
-
         cust=st.session_state.get("cust_data",{})
-
         if cust:
             auto_lat=str(cust.get("Latitude","")).strip()
             auto_lng=str(cust.get("Longitude","")).strip()
@@ -820,11 +1288,9 @@ def page_sales():
             st.markdown(
                 f'<div class="loc-box">'
                 f'📌 <strong>Location auto-loaded from Customer Onboard Data</strong><br>'
-                f'Address: {auto_addr}<br>'
-                f'GPS: {auto_lat}, {auto_lng}'
+                f'Address: {auto_addr}<br>GPS: {auto_lat}, {auto_lng}'
                 f'</div>', unsafe_allow_html=True)
         st.divider()
-
         st.markdown(sl("📦 Order Details"), unsafe_allow_html=True)
         oc1,oc2,oc3=st.columns(3)
         with oc1:
@@ -841,7 +1307,6 @@ def page_sales():
         with oc3:
             o_dcoff=st.time_input("Delivery cut-off",key="o_dcoff")
             o_sopen=st.time_input("Shop opens at",key="o_sopen")
-
         st.markdown(sl("👤 Customer Details"), unsafe_allow_html=True)
         cc1,cc2,cc3=st.columns(3)
         with cc1:
@@ -853,7 +1318,6 @@ def page_sales():
         with cc3:
             st.text_input("Sales executive",value=user["name"],disabled=True,key="c_se")
             st.text_input("SE UID",         value=user["uid"], disabled=True,key="c_seuid")
-
         st.markdown(sl("🛒 SKU / Product"), unsafe_allow_html=True)
         df_sku=active_skus()
         if df_sku.empty:
@@ -872,7 +1336,6 @@ def page_sales():
             with sc3:
                 o_qty=st.number_input("Ordered qty *",min_value=0.0,step=0.5,key="o_qty")
                 st.text_input("Weight type",value=sku_wt,disabled=True,key="o_wt")
-
             o_total=sku_price*o_qty
             if o_qty>0:
                 st.markdown(
@@ -881,28 +1344,21 @@ def page_sales():
                     unsafe_allow_html=True)
             else:
                 st.info("Enter quantity — order total will appear here.")
-
             st.markdown(sl("📍 Shop Location (auto from customer record)"), unsafe_allow_html=True)
             auto_addr=str(cust.get("Shop Address","")).strip() if cust else ""
             auto_lat =str(cust.get("Latitude","")).strip()     if cust else ""
             auto_lng =str(cust.get("Longitude","")).strip()    if cust else ""
-
-            o_addr=st.text_input("Shop address",value=auto_addr,key="o_addr",
-                                  help="Auto-filled from customer record")
+            o_addr=st.text_input("Shop address",value=auto_addr,key="o_addr")
             c_lat_col,c_lng_col=st.columns(2)
             with c_lat_col:
                 o_lat=st.text_input("Latitude",value=auto_lat,key="o_lat",
-                                     disabled=bool(auto_lat),
-                                     help="Loaded from Customer Onboard Data")
+                                     disabled=bool(auto_lat))
             with c_lng_col:
                 o_lng=st.text_input("Longitude",value=auto_lng,key="o_lng",
-                                     disabled=bool(auto_lng),
-                                     help="Loaded from Customer Onboard Data")
-
+                                     disabled=bool(auto_lng))
             if auto_lat and auto_lng:
                 st.markdown(map_embed(auto_lat, auto_lng, 240), unsafe_allow_html=True)
                 st.caption("📍 Customer's registered shop location.")
-
             st.divider()
             if st.button("✅ Submit Order",type="primary",use_container_width=True,key="o_submit"):
                 if not cust:
@@ -915,14 +1371,12 @@ def page_sales():
                     soid="SO-"+o_id.replace("ORD-","")
                     ordered_time=datetime.now().strftime("%H:%M:%S")
                     append_row("base",[
-                        o_id,soid,o_city,
-                        str(o_date),"",ordered_time,
+                        o_id,soid,o_city,str(o_date),"",ordered_time,
                         cust.get("CUST-ID",""),cust.get("Shop Name",""),
                         cust.get("Mobile",""),cust.get("Classification",""),
                         user["name"],user["uid"],
                         sel_sku_code,sel_sku_name,sku_wt,
-                        sku_price,o_qty,o_total,
-                        0,"","","","",
+                        sku_price,o_qty,o_total,0,"","","","",
                         str(o_sopen),"",str(o_dcoff),
                         o_addr,auto_lat,auto_lng,
                         "Pending",user["uid"],
@@ -931,11 +1385,8 @@ def page_sales():
                     st.success(f"✅ Order **{o_id}** submitted!  Total: **₹{o_total:,.2f}**")
                     st.session_state.cust_data={}; st.session_state.task_done=True; st.balloons()
 
-    # ── TAB 1: Customer Onboard ───────────────────────────────────────────────
     with tabs[1]:
         st.markdown(sl("👤 Customer Onboarding"), unsafe_allow_html=True)
-
-        # Search existing
         sc1,sc2=st.columns([3,1])
         with sc1: co_search=st.text_input("Search existing customer by mobile",key="co_search")
         with sc2:
@@ -951,8 +1402,6 @@ def page_sales():
             else:
                 st.info("Not found — fill form below to onboard.")
         st.divider()
-
-        # New customer form
         st.markdown("#### New customer details")
         nc1,nc2=st.columns(2)
         with nc1:
@@ -966,18 +1415,10 @@ def page_sales():
             co_cls =st.selectbox("Classification",
                 ["Restaurants","PG","Pubs","Premium Hotels","Wholesale","Retail","Others"],key="co_cls")
             co_addr=st.text_input("Shop address *",
-                placeholder="e.g. 12/3 MG Road, Bengaluru",
-                key="co_addr")
-
-        # ── GPS SECTION ───────────────────────────────────────────────────────
+                placeholder="e.g. 12/3 MG Road, Bengaluru",key="co_addr")
         st.markdown(sl("📍 Shop GPS Location"), unsafe_allow_html=True)
-
         st.markdown("**Tap the button below to capture your current location:**")
-
-        # The GPS component — handles query param reading + renders button
         captured_lat, captured_lng = gps_capture_component()
-
-        # Show the captured coordinates in a styled box
         if captured_lat and captured_lng:
             st.markdown(
                 f'<div class="gps-box">'
@@ -985,16 +1426,11 @@ def page_sales():
                 f'<span style="color:#185fa5">Lat: {captured_lat}</span>'
                 f' &nbsp;|&nbsp; '
                 f'<span style="color:#185fa5">Lng: {captured_lng}</span>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-            # Show map preview using the captured coordinates
+                f'</div>', unsafe_allow_html=True)
             st.markdown(map_embed(captured_lat, captured_lng, 260), unsafe_allow_html=True)
             st.caption(f"📍 Verify the pin is on the correct shop location. GPS: {captured_lat}, {captured_lng}")
         else:
-            st.info("📍 Press the button above to capture your location. The map will appear here after capture.")
-
-        # ── ONBOARD BUTTON ────────────────────────────────────────────────────
+            st.info("📍 Press the button above to capture your location.")
         st.divider()
         if st.button("✅ Onboard Customer", type="primary", use_container_width=True, key="co_btn"):
             if not all([co_name, co_mob, co_shop, co_addr]):
@@ -1015,18 +1451,12 @@ def page_sales():
                         user["uid"], str(date.today()), "Active",
                     ])
                     load_customers.clear()
-                    # Clear GPS state after successful save
                     st.session_state["_geo_lat"] = ""
                     st.session_state["_geo_lng"] = ""
-                    st.success(
-                        f"✅ Customer onboarded!  "
-                        f"CUST-ID: **`{cid}`**  |  "
-                        f"GPS saved: {captured_lat}, {captured_lng}"
-                    )
+                    st.success(f"✅ Customer onboarded! CUST-ID: **`{cid}`** | GPS: {captured_lat}, {captured_lng}")
                     st.session_state.task_done = True
                     st.balloons()
 
-    # ── TAB 2: My Orders ──────────────────────────────────────────────────────
     with tabs[2]:
         st.markdown(sl("📋 My Orders"), unsafe_allow_html=True)
         df_o=read_sheet("base")
@@ -1043,9 +1473,7 @@ def page_sales():
                     my_show=my[my["ORDER DATE"].astype(str)==today_str]
                     st.caption(f"📅 Today ({today_str}): {len(my_show)} order(s)")
                 else:
-                    my_show=my
-                    st.caption(f"All orders: {len(my_show)}")
-
+                    my_show=my; st.caption(f"All orders: {len(my_show)}")
                 tot_val=my_show["OrderTotal"].apply(
                     lambda x:float(str(x).replace("₹","").replace(",","") or 0)).sum()
                 mc1,mc2,mc3,mc4=st.columns(4)
@@ -1053,9 +1481,8 @@ def page_sales():
                 mc2.metric("Pending",len(my_show[my_show["Delivery Status"]=="Pending"]) if not my_show.empty else 0)
                 mc3.metric("Delivered",len(my_show[my_show["Delivery Status"]=="Delivered"]) if not my_show.empty else 0)
                 mc4.metric("Total value",f"₹{tot_val:,.0f}")
-
                 if my_show.empty:
-                    st.info(f"No orders for today ({today_str}). Check the box above to see all orders.")
+                    st.info(f"No orders for today. Check the box above to see all orders.")
                 else:
                     show_cols=[c for c in ["Order ID","Customer shop name","SKU","SKU Name",
                                            "OrderedQty","OrderTotal","ORDER DATE","ORDERED TIME",
@@ -1069,6 +1496,7 @@ def page_sales():
             st.session_state.task_done=True; st.rerun()
     else:
         st.success("✅ Tasks marked complete — Logout button is now active above.")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PAGE: DELIVERY DRIVER (T2)
@@ -1089,36 +1517,29 @@ def page_delivery():
             st.rerun()
         if not is_active:
             st.warning("You are offline. Tap the button above to go active."); return
-
         trip=get_driver_trip(user["uid"])
         if not trip:
             st.info("📋 No trip assigned. Contact admin."); return
-
         shop_ids=[s.strip() for s in str(trip.get("Shops","")).split(",") if s.strip()]
         st.info(f"**Trip:** {trip['Trip ID']} · **{trip['City']}** · **{trip['Date']}** · {len(shop_ids)} stop(s)")
-
         df_orders=read_sheet("base"); trip_ord={}
         if not df_orders.empty:
             for _,r in df_orders[df_orders["Tripid"].astype(str)==str(trip["Trip ID"])].iterrows():
                 trip_ord[str(r["CustomerId"])]=r.to_dict()
-
         if str(trip.get("Status","")).lower()=="assigned":
             st.warning("Trip not started yet.")
             if st.button("▶️ Start Trip",type="primary",key="start_trip"):
                 update_row("trips","Trip ID",trip["Trip ID"],{"Status":"In Progress"}); st.rerun()
             return
-
         if "active_stop" not in st.session_state: st.session_state.active_stop=0
         done_count=sum(1 for sid in shop_ids
                        if trip_ord.get(sid) and
                           str(trip_ord[sid].get("Delivery Status","")) not in ("Pending",""))
         if done_count>st.session_state.active_stop: st.session_state.active_stop=done_count
         active_idx=st.session_state.active_stop
-
         if len(shop_ids)>0:
             st.progress(active_idx/len(shop_ids),
                         text=f"Progress: {active_idx}/{len(shop_ids)} stops completed")
-
         for i,sid in enumerate(shop_ids):
             shop =find_row("customer_onboard","CUST-ID",sid)
             order=trip_ord.get(sid)
@@ -1140,7 +1561,6 @@ def page_delivery():
                                    f"Qty: {order.get('OrderedQty','')} · ₹{order.get('OrderTotal','')}")
                 with r2:
                     st.markdown(pill(stat,p_cls),unsafe_allow_html=True)
-
             if is_cur and not is_lock:
                 if shop:
                     lat=str(shop.get("Latitude","")); lng=str(shop.get("Longitude",""))
@@ -1175,7 +1595,6 @@ def page_delivery():
                                f"{'Next stop unlocked! 🔓' if i+1<len(shop_ids) else '🎉 All done!'}")
                     st.rerun()
             st.divider()
-
         if active_idx>=len(shop_ids) and len(shop_ids)>0:
             st.success("🎉 All stops completed! Trip finished.")
             update_row("trips","Trip ID",trip["Trip ID"],{"Status":"Completed"})
@@ -1212,6 +1631,7 @@ def page_delivery():
             st.session_state.task_done=True; st.rerun()
     else:
         st.success("✅ Tasks marked complete — Logout button is now active above.")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN ROUTER
