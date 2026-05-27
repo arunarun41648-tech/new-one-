@@ -456,43 +456,40 @@ def enrich_route_row(row: pd.Series, custs_df: pd.DataFrame) -> dict:
     return out
 
 
-def generate_route_template_excel():
-    """Generate a downloadable Excel template for route uploads."""
-    buf = io.BytesIO()
-    df  = pd.DataFrame([
-        {
-            "SaleOrderId": "SO-10001",
-            "DeliveryDate": "2025-06-01",
-            "CustomerId": "CUST-AABBCC",
-            "Customer": "Sri Lakshmi Provision",
-            "Slot": "Morning",
-            "Driver": "Ravi Kumar",
-            "TotalCrates": 4,
-            "OrderKg": 12.5,
-            "Latitude": 12.971599,
-            "Longitude": 77.594566,
-            "FC Latitude": 12.9352,
-            "FC Longitude": 77.6245,
-        },
-        {
-            "SaleOrderId": "SO-10002",
-            "DeliveryDate": "2025-06-01",
-            "CustomerId": "CUST-DDEEFF",
-            "Customer": "Hotel Majestic",
-            "Slot": "Afternoon",
-            "Driver": "Ravi Kumar",
-            "TotalCrates": 2,
-            "OrderKg": 6.0,
-            "Latitude": 12.295810,
-            "Longitude": 76.639380,
-            "FC Latitude": 12.9352,
-            "FC Longitude": 77.6245,
-        },
-    ])
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="Route")
-    buf.seek(0)
-    return buf.read()
+_ROUTE_TEMPLATE_ROWS = [
+    {
+        "SaleOrderId": "SO-10001", "DeliveryDate": "2025-06-01",
+        "CustomerId": "CUST-AABBCC", "Customer": "Sri Lakshmi Provision",
+        "Slot": "Morning", "Driver": "Ravi Kumar",
+        "TotalCrates": 4, "OrderKg": 12.5,
+        "Latitude": 12.971599, "Longitude": 77.594566,
+        "FC Latitude": 12.9352, "FC Longitude": 77.6245,
+    },
+    {
+        "SaleOrderId": "SO-10002", "DeliveryDate": "2025-06-01",
+        "CustomerId": "CUST-DDEEFF", "Customer": "Hotel Majestic",
+        "Slot": "Afternoon", "Driver": "Ravi Kumar",
+        "TotalCrates": 2, "OrderKg": 6.0,
+        "Latitude": 12.295810, "Longitude": 76.639380,
+        "FC Latitude": 12.9352, "FC Longitude": 77.6245,
+    },
+]
+
+def generate_route_template_excel() -> bytes | None:
+    """
+    Generate a downloadable Excel template for route uploads.
+    Returns bytes on success, None if openpyxl is not available.
+    """
+    try:
+        import openpyxl  # noqa: F401  — check availability first
+        buf = io.BytesIO()
+        df  = pd.DataFrame(_ROUTE_TEMPLATE_ROWS)
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            df.to_excel(w, index=False, sheet_name="Route")
+        buf.seek(0)
+        return buf.read()
+    except Exception:
+        return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  AUTH
@@ -771,15 +768,19 @@ def page_admin():
                 '</span>'
                 '</div>', unsafe_allow_html=True)
 
+            _xlsx_bytes = generate_route_template_excel()
             dl_col1, dl_col2 = st.columns(2)
             with dl_col1:
-                st.download_button(
-                    "⬇️ Download Excel Template",
-                    data=generate_route_template_excel(),
-                    file_name="route_template.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_tpl_xlsx",
-                )
+                if _xlsx_bytes:
+                    st.download_button(
+                        "⬇️ Download Excel Template",
+                        data=_xlsx_bytes,
+                        file_name="route_template.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_tpl_xlsx",
+                    )
+                else:
+                    st.info("📋 Excel template unavailable — add `openpyxl` to requirements.txt")
             with dl_col2:
                 st.download_button(
                     "⬇️ Download TSV Template",
