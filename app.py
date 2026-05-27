@@ -317,93 +317,177 @@ def write_admin_log(admin_uid, mail_id, action, entity, entity_id, old="", new="
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ROUTE FILE HELPERS
+#  Format: SaleOrderId | DeliveryDate | CustomerId | Customer | Slot | Driver |
+#          TotalCrates | OrderKg | Latitude | Longitude | FC Latitude | FC Longitude
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Required columns for route file
-ROUTE_REQUIRED_COLS = ["CUST-ID", "Shop Name", "City"]
-ROUTE_OPTIONAL_COLS = ["Shop Address", "Mobile", "Stop Order"]
+ROUTE_REQUIRED_COLS = [
+    "SaleOrderId", "DeliveryDate", "CustomerId", "Customer",
+    "Latitude", "Longitude",
+]
+ROUTE_OPTIONAL_COLS = ["Slot", "Driver", "TotalCrates", "OrderKg", "FC Latitude", "FC Longitude"]
+ROUTE_ALL_COLS      = ROUTE_REQUIRED_COLS + ROUTE_OPTIONAL_COLS
 
-ROUTE_TEMPLATE_CSV = """CUST-ID,Shop Name,City,Shop Address,Mobile,Stop Order
-CUST-AABBCC,Sri Lakshmi Provision,Bengaluru,"12 MG Road, Bengaluru",9876543210,1
-CUST-DDEEFF,Hotel Majestic,Mysuru,"45 Sayyaji Rao Road, Mysuru",9123456789,2
-"""
+ROUTE_TEMPLATE_CSV = (
+    "SaleOrderId\tDeliveryDate\tCustomerId\tCustomer\tSlot\tDriver\t"
+    "TotalCrates\tOrderKg\tLatitude\tLongitude\tFC Latitude\tFC Longitude\n"
+    "SO-10001\t2025-06-01\tCUST-AABBCC\tSri Lakshmi Provision\tMorning\tRavi Kumar\t"
+    "4\t12.5\t12.971599\t77.594566\t12.9352\t77.6245\n"
+    "SO-10002\t2025-06-01\tCUST-DDEEFF\tHotel Majestic\tAfternoon\tRavi Kumar\t"
+    "2\t6.0\t12.295810\t76.639380\t12.9352\t77.6245\n"
+)
+
 
 def parse_route_file(uploaded_file) -> tuple:
     """
-    Parse uploaded CSV or Excel route file.
+    Parse uploaded CSV / TSV / Excel route file with the standard column format.
     Returns (df, errors_list, warnings_list)
     """
     errors = []; warnings = []
     fname  = uploaded_file.name.lower()
     try:
         if fname.endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
+            # Try tab-separated first (common for route exports), fall back to comma
+            raw = uploaded_file.read()
+            uploaded_file.seek(0)
+            sample = raw[:2048].decode("utf-8", errors="replace")
+            sep = "\t" if sample.count("\t") >= sample.count(",") else ","
+            df = pd.read_csv(uploaded_file, sep=sep, dtype=str)
+        elif fname.endswith(".tsv"):
+            df = pd.read_csv(uploaded_file, sep="\t", dtype=str)
         elif fname.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(uploaded_file)
+            df = pd.read_excel(uploaded_file, dtype=str)
         else:
-            return None, ["Unsupported file type. Upload a .csv or .xlsx file."], []
+            return None, ["Unsupported file type. Upload a .csv, .tsv or .xlsx file."], []
     except Exception as e:
         return None, [f"Could not read file: {e}"], []
 
-    # Normalise column names
-    df.columns = [c.strip() for c in df.columns]
+    # Normalise column names — strip whitespace
+    df.columns = [str(c).strip() for c in df.columns]
 
     # Check required columns
     missing = [c for c in ROUTE_REQUIRED_COLS if c not in df.columns]
     if missing:
-        errors.append(f"Missing required column(s): {', '.join(missing)}")
+        errors.append(
+            f"Missing required column(s): **{', '.join(missing)}**  |  "
+            f"Found: {', '.join(df.columns.tolist())}"
+        )
         return None, errors, warnings
 
     # Drop fully empty rows
     df = df.dropna(how="all").reset_index(drop=True)
     if df.empty:
-        errors.append("File contains no data rows."); return None, errors, warnings
+        errors.append("File contains no data rows.")
+        return None, errors, warnings
 
-    # Validate CUST-ID column
-    bad_ids = df[df["CUST-ID"].astype(str).str.strip() == ""]
-    if not bad_ids.empty:
-        warnings.append(f"{len(bad_ids)} row(s) have blank CUST-ID and will be skipped.")
-        df = df[df["CUST-ID"].astype(str).str.strip() != ""].reset_index(drop=True)
+    # Normalise values — strip whitespace in all string cells
+    for col in df.columns:
+        df[col] = df[col].astype(str).str.strip()
 
-    # Validate City column
-    allowed_cities = ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"]
-    bad_cities = df[~df["City"].astype(str).isin(allowed_cities)]
-    if not bad_cities.empty:
-        warnings.append(f"{len(bad_cities)} row(s) have an unknown city value.")
+    # Blank CustomerId rows
+    blank_cid = df[df["CustomerId"].str.strip().isin(["", "nan", "None"])]
+    if not blank_cid.empty:
+        warnings.append(f"{len(blank_cid)} row(s) have a blank CustomerId and will be skipped.")
+        df = df[~df["CustomerId"].str.strip().isin(["", "nan", "None"])].reset_index(drop=True)
 
-    # Sort by Stop Order if present
-    if "Stop Order" in df.columns:
+    # Blank SaleOrderId rows
+    blank_soid = df[df["SaleOrderId"].str.strip().isin(["", "nan", "None"])]
+    if not blank_soid.empty:
+        warnings.append(f"{len(blank_soid)} row(s) have a blank SaleOrderId and will be skipped.")
+        df = df[~df["SaleOrderId"].str.strip().isin(["", "nan", "None"])].reset_index(drop=True)
+
+    # Validate Latitude / Longitude are numeric
+    for coord_col in ("Latitude", "Longitude"):
         try:
-            df["Stop Order"] = pd.to_numeric(df["Stop Order"], errors="coerce")
-            df = df.sort_values("Stop Order", na_position="last").reset_index(drop=True)
+            df[coord_col] = pd.to_numeric(df[coord_col], errors="coerce")
+            bad = df[df[coord_col].isna()]
+            if not bad.empty:
+                warnings.append(f"{len(bad)} row(s) have invalid {coord_col} values.")
         except Exception:
-            warnings.append("Could not sort by 'Stop Order' — using file row order instead.")
+            warnings.append(f"Could not validate {coord_col} column.")
+
+    # Numeric casts for optional numeric cols
+    for num_col in ("TotalCrates", "OrderKg"):
+        if num_col in df.columns:
+            df[num_col] = pd.to_numeric(df[num_col], errors="coerce")
+
+    # Duplicate SaleOrderId check
+    dupes = df[df.duplicated("SaleOrderId", keep=False)]
+    if not dupes.empty:
+        warnings.append(
+            f"{len(dupes)} row(s) share a duplicate SaleOrderId — "
+            f"all will be included but please verify."
+        )
 
     return df, errors, warnings
 
 
 def validate_route_against_customers(route_df: pd.DataFrame, custs_df: pd.DataFrame):
     """
-    Cross-check CUST-IDs in route file against customer_onboard sheet.
-    Returns (matched_df, unmatched_ids)
+    Cross-check CustomerId in route file against customer_onboard sheet (CUST-ID column).
+    Rows that DON'T match are still kept (route may contain IDs not yet onboarded),
+    but we flag them so the admin can decide.
+    Returns (df_with_match_flag, unmatched_ids_list)
     """
     if custs_df.empty:
-        return route_df, []
+        route_df = route_df.copy()
+        route_df["_matched"] = False
+        return route_df, route_df["CustomerId"].tolist()
+
     valid_ids = set(custs_df["CUST-ID"].astype(str).str.strip())
-    route_ids = route_df["CUST-ID"].astype(str).str.strip()
-    matched   = route_df[route_ids.isin(valid_ids)].reset_index(drop=True)
-    unmatched = route_ids[~route_ids.isin(valid_ids)].tolist()
-    return matched, unmatched
+    route_ids = route_df["CustomerId"].astype(str).str.strip()
+    route_df  = route_df.copy()
+    route_df["_matched"] = route_ids.isin(valid_ids)
+    unmatched = route_ids[~route_ids.isin(valid_ids)].unique().tolist()
+    return route_df, unmatched
+
+
+def enrich_route_row(row: pd.Series, custs_df: pd.DataFrame) -> dict:
+    """Pull extra info (shop address, classification) from customer master if available."""
+    out = {"address": "", "classification": "", "city": ""}
+    if custs_df.empty: return out
+    cid = str(row.get("CustomerId","")).strip()
+    m   = custs_df[custs_df["CUST-ID"] == cid]
+    if not m.empty:
+        r = m.iloc[0]
+        out["address"]        = str(r.get("Shop Address",""))
+        out["classification"] = str(r.get("Classification",""))
+        out["city"]           = str(r.get("City",""))
+    return out
 
 
 def generate_route_template_excel():
     """Generate a downloadable Excel template for route uploads."""
     buf = io.BytesIO()
     df  = pd.DataFrame([
-        {"CUST-ID":"CUST-AABBCC","Shop Name":"Sri Lakshmi Provision","City":"Bengaluru",
-         "Shop Address":"12 MG Road, Bengaluru","Mobile":"9876543210","Stop Order":1},
-        {"CUST-ID":"CUST-DDEEFF","Shop Name":"Hotel Majestic","City":"Mysuru",
-         "Shop Address":"45 Sayyaji Rao Road, Mysuru","Mobile":"9123456789","Stop Order":2},
+        {
+            "SaleOrderId": "SO-10001",
+            "DeliveryDate": "2025-06-01",
+            "CustomerId": "CUST-AABBCC",
+            "Customer": "Sri Lakshmi Provision",
+            "Slot": "Morning",
+            "Driver": "Ravi Kumar",
+            "TotalCrates": 4,
+            "OrderKg": 12.5,
+            "Latitude": 12.971599,
+            "Longitude": 77.594566,
+            "FC Latitude": 12.9352,
+            "FC Longitude": 77.6245,
+        },
+        {
+            "SaleOrderId": "SO-10002",
+            "DeliveryDate": "2025-06-01",
+            "CustomerId": "CUST-DDEEFF",
+            "Customer": "Hotel Majestic",
+            "Slot": "Afternoon",
+            "Driver": "Ravi Kumar",
+            "TotalCrates": 2,
+            "OrderKg": 6.0,
+            "Latitude": 12.295810,
+            "Longitude": 76.639380,
+            "FC Latitude": 12.9352,
+            "FC Longitude": 77.6245,
+        },
     ])
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="Route")
@@ -665,12 +749,26 @@ def page_admin():
         with trip_sub[0]:
             st.markdown("#### 📂 Upload a Route File to Create a Trip")
 
-            # Template download
+            # ── Column spec box ──────────────────────────────────────────────
             st.markdown(
                 '<div class="template-box">'
-                '📄 <strong>Required columns:</strong> '
-                '<code>CUST-ID</code>, <code>Shop Name</code>, <code>City</code> &nbsp;|&nbsp; '
-                'Optional: <code>Shop Address</code>, <code>Mobile</code>, <code>Stop Order</code>'
+                '📄 <strong>Required columns:</strong> &nbsp;'
+                '<code>SaleOrderId</code> &nbsp;'
+                '<code>DeliveryDate</code> &nbsp;'
+                '<code>CustomerId</code> &nbsp;'
+                '<code>Customer</code> &nbsp;'
+                '<code>Latitude</code> &nbsp;'
+                '<code>Longitude</code>'
+                '<br><span style="color:#854f0b">Optional:</span> &nbsp;'
+                '<code>Slot</code> &nbsp;'
+                '<code>Driver</code> &nbsp;'
+                '<code>TotalCrates</code> &nbsp;'
+                '<code>OrderKg</code> &nbsp;'
+                '<code>FC Latitude</code> &nbsp;'
+                '<code>FC Longitude</code>'
+                '<br><span style="color:#5a7a65;font-size:.82rem">'
+                '💡 Accepts comma-separated .csv, tab-separated .csv/.tsv, and .xlsx'
+                '</span>'
                 '</div>', unsafe_allow_html=True)
 
             dl_col1, dl_col2 = st.columns(2)
@@ -684,10 +782,10 @@ def page_admin():
                 )
             with dl_col2:
                 st.download_button(
-                    "⬇️ Download CSV Template",
+                    "⬇️ Download TSV Template",
                     data=ROUTE_TEMPLATE_CSV,
-                    file_name="route_template.csv",
-                    mime="text/csv",
+                    file_name="route_template.tsv",
+                    mime="text/tab-separated-values",
                     key="dl_tpl_csv",
                 )
 
@@ -695,173 +793,275 @@ def page_admin():
 
             # ── File uploader ────────────────────────────────────────────────
             uploaded = st.file_uploader(
-                "Upload your Route File (.csv or .xlsx)",
-                type=["csv","xlsx","xls"],
+                "Upload your Route File (.csv, .tsv or .xlsx)",
+                type=["csv","tsv","xlsx","xls"],
                 key="route_uploader",
-                help="Each row = one shop stop. CUST-ID must match Customer Onboard Data.",
+                help="Each row = one delivery stop. CustomerId should match Customer Onboard Data.",
             )
 
             if uploaded:
-                # Parse immediately on upload
                 with st.spinner("Parsing route file…"):
-                    df_route, errors, warnings = parse_route_file(uploaded)
+                    df_route, parse_errors, parse_warnings = parse_route_file(uploaded)
 
-                if errors:
-                    for e in errors:
+                if parse_errors:
+                    for e in parse_errors:
                         st.error(f"❌ {e}")
                 else:
-                    # Validate against customer master
-                    df_matched, unmatched_ids = validate_route_against_customers(df_route, custs_df)
+                    # Cross-check against customer master (non-blocking)
+                    df_flagged, unmatched_ids = validate_route_against_customers(df_route, custs_df)
 
-                    # Show warnings
-                    for w in warnings:
+                    # Show parse warnings
+                    for w in parse_warnings:
                         st.warning(f"⚠️ {w}")
-                    if unmatched_ids:
-                        st.warning(f"⚠️ {len(unmatched_ids)} CUST-ID(s) not found in Customer Onboard Data "
-                                   f"and will be skipped: `{', '.join(unmatched_ids[:8])}`"
-                                   + (" …" if len(unmatched_ids)>8 else ""))
 
-                    if df_matched.empty:
-                        st.error("❌ No valid customer rows after validation. Check your CUST-IDs.")
-                    else:
-                        # ── Preview card ─────────────────────────────────────
-                        st.success(f"✅ **{len(df_matched)} valid stop(s)** found in route file.")
+                    # Unmatched customer IDs — warn but keep all rows
+                    if unmatched_ids:
+                        st.warning(
+                            f"⚠️ **{len(unmatched_ids)} CustomerId(s)** not found in Customer Onboard Data — "
+                            f"rows kept but marked. IDs: `{', '.join(str(x) for x in unmatched_ids[:10])}`"
+                            + (" …" if len(unmatched_ids) > 10 else "")
+                        )
+
+                    total_rows = len(df_flagged)
+                    matched_rows   = int(df_flagged["_matched"].sum())
+                    unmatched_rows = total_rows - matched_rows
+
+                    # ── File-level summary metrics ────────────────────────────
+                    sm1, sm2, sm3, sm4 = st.columns(4)
+                    sm1.metric("Total Stops",   total_rows)
+                    sm2.metric("✅ Matched",     matched_rows)
+                    sm3.metric("⚠️ Unmatched",  unmatched_rows)
+                    # Aggregate TotalCrates and OrderKg if present
+                    if "TotalCrates" in df_flagged.columns:
+                        try:
+                            total_crates = pd.to_numeric(df_flagged["TotalCrates"], errors="coerce").sum()
+                            sm4.metric("📦 Total Crates", f"{total_crates:,.0f}")
+                        except Exception:
+                            sm4.metric("📦 Total Crates", "—")
+
+                    st.divider()
+
+                    # ── Route Preview Table ───────────────────────────────────
+                    st.markdown(
+                        f'<div class="route-card">'
+                        f'<div class="route-card-header">'
+                        f'🗺️ Route Preview — {total_rows} Stop(s) from <em>{uploaded.name}</em>'
+                        f'</div>',
+                        unsafe_allow_html=True)
+
+                    for i, row in df_flagged.iterrows():
+                        cid        = str(row.get("CustomerId", "")).strip()
+                        customer   = str(row.get("Customer", "")).strip()
+                        sale_oid   = str(row.get("SaleOrderId", "")).strip()
+                        slot       = str(row.get("Slot", "")).strip()
+                        lat        = row.get("Latitude", "")
+                        lng        = row.get("Longitude", "")
+                        crates     = row.get("TotalCrates", "")
+                        kg         = row.get("OrderKg", "")
+                        is_matched = bool(row.get("_matched", False))
+
+                        # Enrich address / city from customer master
+                        enrich     = enrich_route_row(row, custs_df)
+                        city_label = enrich["city"] or ""
+                        addr_label = enrich["address"] or ""
+
+                        match_ico  = "✅" if is_matched else "⚠️"
+                        lat_str    = f"{float(lat):.5f}" if pd.notna(lat) and str(lat) not in ("","nan") else "?"
+                        lng_str    = f"{float(lng):.5f}" if pd.notna(lng) and str(lng) not in ("","nan") else "?"
+
+                        details = []
+                        if slot and slot != "nan":       details.append(f"🕐 {slot}")
+                        if crates and str(crates) not in ("","nan"): details.append(f"📦 {crates} crates")
+                        if kg    and str(kg)     not in ("","nan"): details.append(f"⚖️ {kg} kg")
+                        if city_label: details.append(f"📍 {city_label}")
+                        detail_str = " &nbsp;·&nbsp; ".join(details)
 
                         st.markdown(
-                            f'<div class="route-card">'
-                            f'<div class="route-card-header">🗺️ Route Preview — {len(df_matched)} Stops</div>',
+                            f'<div class="route-row">'
+                            f'<span class="stop-badge">{i+1}</span>'
+                            f'<span style="min-width:14px">{match_ico}</span>'
+                            f'<div style="flex:1">'
+                            f'<strong>{customer}</strong>'
+                            f'&nbsp;<span style="color:#5a7a65;font-size:.8rem">({cid})</span>'
+                            f'&nbsp;·&nbsp;<code style="font-size:.78rem">{sale_oid}</code>'
+                            + (f'<br><span style="color:#5a7a65;font-size:.8rem">{detail_str}</span>' if detail_str else "")
+                            + f'</div>'
+                            f'<span style="color:#185fa5;font-size:.78rem;white-space:nowrap">'
+                            f'{lat_str}, {lng_str}</span>'
+                            f'</div>',
                             unsafe_allow_html=True)
 
-                        for i, row in df_matched.iterrows():
-                            cid  = str(row.get("CUST-ID","")).strip()
-                            shop = str(row.get("Shop Name","")).strip()
-                            city = str(row.get("City","")).strip()
-                            addr = str(row.get("Shop Address","")).strip()
+                    st.markdown('</div>', unsafe_allow_html=True)
 
-                            # Enrich from customer master if available
-                            if not custs_df.empty:
-                                cm = custs_df[custs_df["CUST-ID"]==cid]
-                                if not cm.empty:
-                                    shop = cm.iloc[0].get("Shop Name", shop) or shop
-                                    addr = cm.iloc[0].get("Shop Address", addr) or addr
-                                    city = cm.iloc[0].get("City", city) or city
+                    # ── Full raw data expander ────────────────────────────────
+                    with st.expander("📊 View full raw data table"):
+                        display_cols = [c for c in ROUTE_ALL_COLS if c in df_flagged.columns]
+                        st.dataframe(
+                            df_flagged[display_cols],
+                            use_container_width=True, hide_index=True)
 
-                            st.markdown(
-                                f'<div class="route-row">'
-                                f'<span class="stop-badge">{i+1}</span>'
-                                f'<strong>{shop}</strong>'
-                                f'&nbsp;<span style="color:#5a7a65;font-size:.83rem">({cid})</span>'
-                                f'&nbsp;·&nbsp;<span style="color:#185fa5">{city}</span>'
-                                + (f'&nbsp;·&nbsp;<span style="color:#854f0b;font-size:.8rem">{addr}</span>' if addr else "")
-                                + f'</div>',
-                                unsafe_allow_html=True)
+                    # ── Trip creation settings ────────────────────────────────
+                    st.divider()
+                    st.markdown("#### ⚙️ Trip Settings")
 
-                        st.markdown('</div>', unsafe_allow_html=True)
-
-                        # ── Trip creation form ────────────────────────────────
-                        st.divider()
-                        st.markdown("#### ⚙️ Trip Settings")
-
-                        rf1, rf2, rf3 = st.columns(3)
-                        with rf1:
-                            auto_trip_id = gen_trip_id()
-                            rf_trip_id = st.text_input(
-                                "Trip ID *",
-                                value=auto_trip_id,
-                                key="rf_trip_id",
-                                help="Auto-generated — edit if needed")
-                        with rf2:
-                            rf_date = st.date_input("Trip Date *", value=date.today(), key="rf_date")
-                        with rf3:
-                            # Auto-detect city from most common city in file
-                            city_mode = df_matched["City"].mode()
-                            def_city  = city_mode.iloc[0] if not city_mode.empty else "Bengaluru"
-                            allowed_cities = ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"]
-                            def_idx = allowed_cities.index(def_city) if def_city in allowed_cities else 0
-                            rf_city = st.selectbox("City *", allowed_cities, index=def_idx, key="rf_city")
-
-                        # Driver assignment (optional at creation)
-                        all_d = all_drivers()
-                        rf_drv_uid = ""; rf_drv_name = ""
-                        if not all_d.empty:
-                            drv_opts  = ["⬜ Assign later"] + [
-                                f"{'🟢' if str(r.get('Active Status','')).lower()=='active' else '⚫'} "
-                                f"{r['Full Name']} ({r['Driver ID']})"
-                                for _,r in all_d.iterrows()
-                            ]
-                            drv_ids   = [""] + all_d["Driver ID"].tolist()
-                            drv_names = [""] + all_d["Full Name"].tolist()
-                            sel_drv   = st.selectbox(
-                                "Assign Driver (optional — can do later)",
-                                drv_opts, key="rf_driver_sel")
-                            drv_idx   = drv_opts.index(sel_drv)
-                            rf_drv_uid  = drv_ids[drv_idx]
-                            rf_drv_name = drv_names[drv_idx]
-
-                        st.divider()
-
-                        # ── Summary before create ─────────────────────────────
-                        st.markdown(
-                            f'<div class="route-card">'
-                            f'<div class="route-card-header">📋 Trip Summary</div>'
-                            f'<div class="route-row"><span style="width:120px;color:#5a7a65">Trip ID</span>'
-                            f'<strong>{rf_trip_id}</strong></div>'
-                            f'<div class="route-row"><span style="width:120px;color:#5a7a65">Date</span>'
-                            f'<strong>{rf_date}</strong></div>'
-                            f'<div class="route-row"><span style="width:120px;color:#5a7a65">City</span>'
-                            f'<strong>{rf_city}</strong></div>'
-                            f'<div class="route-row"><span style="width:120px;color:#5a7a65">Stops</span>'
-                            f'<strong>{len(df_matched)}</strong></div>'
-                            f'<div class="route-row"><span style="width:120px;color:#5a7a65">Driver</span>'
-                            f'<strong>{rf_drv_name or "To be assigned"}</strong></div>'
-                            f'</div>', unsafe_allow_html=True)
-
-                        if st.button("✅ Create Trip from Route File",
-                                     type="primary", use_container_width=True,
-                                     key="rf_create_trip"):
-                            if not rf_trip_id.strip():
-                                st.error("Trip ID is required.")
-                            elif col_exists("trips","Trip ID", rf_trip_id.strip()):
-                                st.error(f"Trip ID **{rf_trip_id}** already exists. Change it.")
-                            else:
-                                shop_ids_str = ",".join(df_matched["CUST-ID"].astype(str).str.strip().tolist())
-                                status = "Assigned" if rf_drv_uid else "Unassigned"
-                                append_row("trips",[
-                                    rf_trip_id.strip(),
-                                    str(rf_date),
-                                    rf_city,
-                                    shop_ids_str,
-                                    rf_drv_uid,
-                                    rf_drv_name,
-                                    status,
-                                    user["uid"],
-                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                ])
-                                write_admin_log(
-                                    user["uid"], user.get("email",""),
-                                    "CREATE TRIP (ROUTE FILE)", "Trip",
-                                    rf_trip_id.strip(), "",
-                                    rf_drv_name or "Unassigned",
-                                    f"{len(df_matched)} stops from {uploaded.name}"
+                    rf1, rf2, rf3 = st.columns(3)
+                    with rf1:
+                        # Auto-fill Trip ID from file's DeliveryDate if parseable
+                        auto_date_str = ""
+                        if "DeliveryDate" in df_flagged.columns:
+                            try:
+                                first_date = pd.to_datetime(
+                                    df_flagged["DeliveryDate"].dropna().iloc[0], dayfirst=False
                                 )
-                                drv_msg = f" · Driver: **{rf_drv_name}**" if rf_drv_name else " · Driver: **to be assigned**"
-                                st.success(
-                                    f"✅ Trip **{rf_trip_id}** created with "
-                                    f"**{len(df_matched)} stop(s)**{drv_msg}!"
-                                )
-                                st.session_state.route_parsed_df  = None
-                                st.session_state.route_file_name  = None
-                                st.session_state.task_done        = True
-                                st.balloons()
-                                st.rerun()
+                                auto_date_str = first_date.strftime("%Y%m%d")
+                            except Exception:
+                                pass
+                        auto_trip_id = f"TRP-{auto_date_str or datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+                        rf_trip_id   = st.text_input(
+                            "Trip ID *", value=auto_trip_id, key="rf_trip_id",
+                            help="Auto-generated from DeliveryDate — edit if needed")
+
+                    with rf2:
+                        # Auto-fill date from file
+                        rf_default_date = date.today()
+                        if "DeliveryDate" in df_flagged.columns:
+                            try:
+                                rf_default_date = pd.to_datetime(
+                                    df_flagged["DeliveryDate"].dropna().iloc[0], dayfirst=False
+                                ).date()
+                            except Exception:
+                                pass
+                        rf_date = st.date_input("Trip Date *", value=rf_default_date, key="rf_date")
+
+                    with rf3:
+                        allowed_cities = ["Bengaluru","Mysuru","Hubli","Mangaluru","Hassan","Tumkur"]
+                        rf_city = st.selectbox("City *", allowed_cities, key="rf_city")
+
+                    # ── Driver auto-suggest from file ─────────────────────────
+                    file_driver_name = ""
+                    if "Driver" in df_flagged.columns:
+                        drv_vals = df_flagged["Driver"].dropna()
+                        drv_vals = drv_vals[~drv_vals.isin(["","nan","None"])]
+                        if not drv_vals.empty:
+                            file_driver_name = drv_vals.mode().iloc[0]
+
+                    all_d = all_drivers()
+                    rf_drv_uid = ""; rf_drv_name = ""
+                    if not all_d.empty:
+                        # Try to pre-select driver whose name matches file's Driver column
+                        pre_idx = 0
+                        if file_driver_name:
+                            for _di, _dr in enumerate(all_d["Full Name"].tolist()):
+                                if file_driver_name.strip().lower() in _dr.lower() or \
+                                   _dr.lower() in file_driver_name.strip().lower():
+                                    pre_idx = _di + 1   # +1 because index 0 = "Assign later"
+                                    break
+
+                        drv_opts  = ["⬜ Assign later"] + [
+                            f"{'🟢' if str(r.get('Active Status','')).lower()=='active' else '⚫'} "
+                            f"{r['Full Name']}  ({r['Driver ID']})"
+                            for _, r in all_d.iterrows()
+                        ]
+                        drv_ids   = [""] + all_d["Driver ID"].tolist()
+                        drv_names = [""] + all_d["Full Name"].tolist()
+
+                        if file_driver_name:
+                            st.info(f"💡 Route file suggests driver: **{file_driver_name}**")
+
+                        sel_drv = st.selectbox(
+                            "Assign Driver (optional — can reassign later)",
+                            drv_opts, index=min(pre_idx, len(drv_opts)-1),
+                            key="rf_driver_sel")
+                        drv_idx     = drv_opts.index(sel_drv)
+                        rf_drv_uid  = drv_ids[drv_idx]
+                        rf_drv_name = drv_names[drv_idx]
+                    else:
+                        st.info("No drivers onboarded yet — you can assign one after creating the trip.")
+
+                    st.divider()
+
+                    # ── Trip summary card ─────────────────────────────────────
+                    total_kg = ""
+                    total_cr = ""
+                    if "OrderKg" in df_flagged.columns:
+                        try: total_kg = f"{pd.to_numeric(df_flagged['OrderKg'], errors='coerce').sum():,.1f} kg"
+                        except Exception: pass
+                    if "TotalCrates" in df_flagged.columns:
+                        try: total_cr = f"{pd.to_numeric(df_flagged['TotalCrates'], errors='coerce').sum():,.0f} crates"
+                        except Exception: pass
+
+                    st.markdown(
+                        f'<div class="route-card">'
+                        f'<div class="route-card-header">📋 Trip Summary — confirm before saving</div>'
+                        f'<div class="route-row"><span style="width:140px;color:#5a7a65">Trip ID</span>'
+                        f'<strong>{rf_trip_id}</strong></div>'
+                        f'<div class="route-row"><span style="width:140px;color:#5a7a65">Delivery Date</span>'
+                        f'<strong>{rf_date}</strong></div>'
+                        f'<div class="route-row"><span style="width:140px;color:#5a7a65">City</span>'
+                        f'<strong>{rf_city}</strong></div>'
+                        f'<div class="route-row"><span style="width:140px;color:#5a7a65">Total Stops</span>'
+                        f'<strong>{total_rows}</strong>'
+                        f'&nbsp;({matched_rows} matched &nbsp;/&nbsp; {unmatched_rows} unmatched)</div>'
+                        + (f'<div class="route-row"><span style="width:140px;color:#5a7a65">Total Kg</span>'
+                           f'<strong>{total_kg}</strong></div>' if total_kg else "")
+                        + (f'<div class="route-row"><span style="width:140px;color:#5a7a65">Total Crates</span>'
+                           f'<strong>{total_cr}</strong></div>' if total_cr else "")
+                        + f'<div class="route-row"><span style="width:140px;color:#5a7a65">Driver</span>'
+                        f'<strong>{rf_drv_name or "To be assigned"}</strong></div>'
+                        f'<div class="route-row"><span style="width:140px;color:#5a7a65">Source file</span>'
+                        f'<span style="color:#5a7a65">{uploaded.name}</span></div>'
+                        f'</div>', unsafe_allow_html=True)
+
+                    if st.button("✅ Create Trip from Route File",
+                                 type="primary", use_container_width=True,
+                                 key="rf_create_trip"):
+                        if not rf_trip_id.strip():
+                            st.error("Trip ID is required.")
+                        elif col_exists("trips", "Trip ID", rf_trip_id.strip()):
+                            st.error(f"Trip ID **{rf_trip_id}** already exists. Please change it.")
+                        else:
+                            # Store CustomerId list as the shops string
+                            shop_ids_str = ",".join(
+                                df_flagged["CustomerId"].astype(str).str.strip().tolist()
+                            )
+                            status = "Assigned" if rf_drv_uid else "Unassigned"
+                            append_row("trips", [
+                                rf_trip_id.strip(),
+                                str(rf_date),
+                                rf_city,
+                                shop_ids_str,
+                                rf_drv_uid,
+                                rf_drv_name,
+                                status,
+                                user["uid"],
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            ])
+                            write_admin_log(
+                                user["uid"], user.get("email", ""),
+                                "CREATE TRIP (ROUTE FILE)", "Trip",
+                                rf_trip_id.strip(), "",
+                                rf_drv_name or "Unassigned",
+                                f"{total_rows} stops | {total_kg or '?'} | {total_cr or '?'} | {uploaded.name}"
+                            )
+                            drv_msg = f" · Driver: **{rf_drv_name}**" if rf_drv_name else " · Driver: **to be assigned**"
+                            st.success(
+                                f"✅ Trip **{rf_trip_id}** created — "
+                                f"**{total_rows} stop(s)**{drv_msg}!"
+                            )
+                            st.session_state.task_done = True
+                            st.balloons()
+                            st.rerun()
 
             else:
                 st.markdown(
                     '<div class="upload-zone">'
                     '<span style="font-size:2.2rem">📂</span><br>'
-                    '<strong style="font-family:Syne,sans-serif;color:#1a7f4b">Drop your route file here</strong><br>'
-                    '<span style="color:#5a7a65;font-size:.88rem">Supports .csv and .xlsx — '
-                    'download the template above to get started</span>'
+                    '<strong style="font-family:Syne,sans-serif;color:#1a7f4b">'
+                    'Drop your route file here</strong><br>'
+                    '<span style="color:#5a7a65;font-size:.88rem">'
+                    'Accepts .csv (comma or tab), .tsv, .xlsx — '
+                    'download the template above to get started'
+                    '</span>'
                     '</div>', unsafe_allow_html=True)
 
         # ════════════════════════════════════════
