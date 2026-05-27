@@ -768,7 +768,12 @@ def page_admin():
                 '</span>'
                 '</div>', unsafe_allow_html=True)
 
-            _xlsx_bytes = generate_route_template_excel()
+            # ── Template downloads — wrapped so a missing openpyxl never crashes the page ──
+            try:
+                _xlsx_bytes = generate_route_template_excel()
+            except Exception:
+                _xlsx_bytes = None
+
             dl_col1, dl_col2 = st.columns(2)
             with dl_col1:
                 if _xlsx_bytes:
@@ -780,13 +785,13 @@ def page_admin():
                         key="dl_tpl_xlsx",
                     )
                 else:
-                    st.info("📋 Excel template unavailable — add `openpyxl` to requirements.txt")
+                    st.caption("📋 Excel template unavailable (openpyxl missing in env)")
             with dl_col2:
                 st.download_button(
-                    "⬇️ Download TSV Template",
+                    "⬇️ Download CSV Template",
                     data=ROUTE_TEMPLATE_CSV,
-                    file_name="route_template.tsv",
-                    mime="text/tab-separated-values",
+                    file_name="route_template.csv",
+                    mime="text/csv",
                     key="dl_tpl_csv",
                 )
 
