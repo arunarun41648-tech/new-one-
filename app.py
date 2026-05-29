@@ -671,7 +671,7 @@ def page_admin():
     user = st.session_state.user
     topbar("🛡️ Admin","#185fa5")
     tabs = st.tabs(["📦 SKUs","🗺️ Trips","🚚 Assign Drivers",
-                    "👤 Customers","🚗 Driver Onboard","📋 Orders","📝 Audit Log"])
+                    "👤 Customers","🚗 Driver Onboard","📋 Orders","📝 Audit Log","🛣️ Route Planner"])
 
     # ──────────────────────────────────────────────────────────────────────────
     # TAB 0 — SKUs
@@ -1451,6 +1451,27 @@ def page_admin():
         else:
             st.dataframe(df_l.sort_values("Timestamp",ascending=False),
                          use_container_width=True,hide_index=True)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TAB 7 — Route Planner
+    # ──────────────────────────────────────────────────────────────────────────
+    with tabs[7]:
+        try:
+            from page_route_planner_ui import page_route_planner
+            page_route_planner(user, {
+                "read_sheet":      read_sheet,
+                "append_row":      append_row,
+                "update_row":      update_row,
+                "col_exists":      col_exists,
+                "write_admin_log": write_admin_log,
+                "load_customers":  load_customers,
+                "all_drivers":     all_drivers,
+                "gen_trip_id":     gen_trip_id,
+            })
+        except ImportError as _rp_err:
+            st.error(f"❌ Could not load Route Planner module: {_rp_err}")
+            st.info("Make sure **page_route_planner.py** and **page_route_planner_ui.py** are in the same directory as app.py.")
+
 
     st.divider()
     if not st.session_state.get("task_done",False):
